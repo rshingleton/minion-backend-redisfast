@@ -42,7 +42,7 @@
       },
       "runtime" : {
          "requires" : {
-            "perl" : "v5.26.0"
+            "perl" : "5.024004"
          }
       },
       "test" : {
