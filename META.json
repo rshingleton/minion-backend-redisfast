@@ -1,7 +1,7 @@
 {
-   "abstract" : "It's new $module",
+   "abstract" : "High-performance Redis backend for Minion job queue",
    "author" : [
-      "Russell Shingleton <reshingleton@gmail.com>"
+      "Your Name <your@email.com>"
    ],
    "dynamic_config" : 0,
    "generated_by" : "Minilla/v3.1.25, CPAN::Meta::Converter version 2.150010",
@@ -12,7 +12,7 @@
       "url" : "http://search.cpan.org/perldoc?CPAN::Meta::Spec",
       "version" : 2
    },
-   "name" : "minion-backend-redisfast",
+   "name" : "Minion-Backend-RedisFast",
    "no_index" : {
       "directory" : [
          "t",
@@ -42,7 +42,7 @@
       },
       "runtime" : {
          "requires" : {
-            "perl" : "5.008001"
+            "perl" : "v5.26.0"
          }
       },
       "test" : {
@@ -52,7 +52,21 @@
       }
    },
    "release_status" : "unstable",
-   "version" : "0.01",
+   "resources" : {
+      "bugtracker" : {
+         "web" : "https://github.com/rshingleton/minion-backend-redisfast/issues"
+      },
+      "homepage" : "https://github.com/rshingleton/minion-backend-redisfast",
+      "repository" : {
+         "type" : "git",
+         "url" : "https://github.com/rshingleton/minion-backend-redisfast.git",
+         "web" : "https://github.com/rshingleton/minion-backend-redisfast"
+      }
+   },
+   "version" : "0.001",
+   "x_contributors" : [
+      "Russell Shingleton <reshingleton@gmail.com>"
+   ],
    "x_serialization_backend" : "JSON::PP version 4.07",
    "x_static_install" : 1
 }

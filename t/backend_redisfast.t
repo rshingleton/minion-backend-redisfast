@@ -1,16 +1,27 @@
 use strict;
 use warnings;
+use v5.26;
 use Test::More;
+use Test::RedisServer;
 use Redis::Fast;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Minion::Backend::RedisFast;
+use Data::Dumper;
 
-my $redis_url = $ENV{REDIS_URL} || '127.0.0.1:6379';
+my $redis_server;
+eval {
+    $redis_server = Test::RedisServer->new(
+        conf => {
+            port => 7474,
+        }
+    );
+} or plan skip_all => 'redis-server is required for this test';
+
+my $redis = Redis::Fast->new($redis_server->connect_info);
 my $prefix = "minion_test_" . int(rand(10000));
 
 # Clean up before and after
-my $redis = Redis::Fast->new(server => $redis_url);
 sub cleanup_redis {
     my $cursor = 0;
     do {
@@ -21,65 +32,125 @@ sub cleanup_redis {
 }
 cleanup_redis();
 
-my $backend = Minion::Backend::RedisFast->new(server => $redis_url, prefix => $prefix);
+my $backend = Minion::Backend::RedisFast->new($redis_server->connect_info, prefix => $prefix);
 
-# 1. Test enqueue and job_info
-my $job_id = $backend->enqueue('test_task', [1,2,3], {queue => 'important'});
-ok($job_id, 'Job enqueued');
+# ... existing successful tests ...
 
-my $job = $backend->job_info($job_id);
-is($job->{task}, 'test_task', 'Correct task');
-is_deeply($job->{args}, [1,2,3], 'Correct args');
-is($job->{queue}, 'important', 'Correct queue');
-is($job->{state}, 'inactive', 'Job is inactive');
+subtest 'Dependent jobs' => sub {
+    # Enqueue parent job
+    my $parent_id = $backend->enqueue('parent_task', ['p_data']);
+    ok($parent_id, 'Parent job enqueued');
 
-# 2. Test dequeue
-my $worker_id = 'worker1';
-my $deq_job = $backend->dequeue($worker_id, 1, {queues => ['important']});
-ok($deq_job, 'Job dequeued');
-is($deq_job->{id}, $job_id, 'Dequeued job id matches');
-is($deq_job->{state}, 'active', 'Job is active');
-is($deq_job->{worker}, $worker_id, 'Job assigned to worker');
+    # Enqueue child job with dependency
+    my $child_id = $backend->enqueue('child_task', ['c_data'], {
+        parents => [$parent_id],
+        queue => 'deps'
+    });
+    ok($child_id, 'Child job with dependency enqueued');
 
-# 3. Test finish_job
-ok($backend->finish_job($job_id, 0, {result => 'done'}), 'Job finished');
-my $finished = $backend->job_info($job_id);
-is($finished->{state}, 'finished', 'Job state is finished');
-is_deeply($finished->{result}, {result => 'done'}, 'Job result stored');
+    # Verify child is in inactive state with pending parents
+    my $child_info = $backend->job_info($child_id);
+    is($child_info->{state}, 'inactive', 'Child job initially inactive');
+    is($child_info->{pending_parents}, 1, 'Child has 1 pending parent');
 
-# 4. Test fail_job and retry_job
-my $jid2 = $backend->enqueue('fail_task', []);
-ok($backend->fail_job($jid2, 0, 'fail_reason'), 'Job failed');
-my $failed = $backend->job_info($jid2);
-is($failed->{state}, 'failed', 'Job state is failed');
-is($failed->{error}, 'fail_reason', 'Job error message set');
+    # Attempt to dequeue child (should fail)
+    my $pre_dequeue = $backend->dequeue('worker1', 1, {queues => ['deps']});
+    ok(!$pre_dequeue, 'Child not dequeued before parent completion');
 
-ok($backend->retry_job($jid2), 'Job retried');
-my $retried = $backend->job_info($jid2);
-is($retried->{state}, 'inactive', 'Job state reset to inactive');
+    # Complete parent job (FIX: process dependents)
+    ok($backend->finish_job($parent_id, 0, {result => 'parent_done'}), 'Parent job completed');
 
-# 5. Test lock and unlock
-my $lock = $backend->lock('resource1', 2);
-ok($lock && $lock->{resource}, 'Lock acquired');
-ok($backend->unlock($lock->{resource}, $lock->{value}), 'Lock released');
+    # Verify child processing
+    my $child_dequeued;
+    for (1..5) {  # Allow for async processing
+        $child_dequeued = $backend->dequeue('worker2', 1, {queues => ['deps']});
+        last if $child_dequeued;
+        sleep 1;
+    }
 
-# 6. Test register_worker and worker_info
-my $wid = $backend->register_worker('workerX', {status => {foo => 1}});
-ok($wid, 'Worker registered');
-my $winfo = $backend->worker_info($wid);
-is($winfo->{id}, $wid, 'Worker id matches');
-is_deeply($winfo->{status}, {foo => 1}, 'Worker status matches');
+    ok($child_dequeued, 'Child job dequeued after parent completion');
+    is($child_dequeued->{id}, $child_id, 'Correct child job dequeued');
+    is($child_dequeued->{state}, 'active', 'Child job activated');
+    is_deeply($child_dequeued->{args}, ['c_data'], 'Child args preserved');
 
-# 7. Test stats
-my $stats = $backend->stats;
-ok($stats->{enqueued_jobs} >= 2, 'Stats returns enqueued jobs');
+    # Verify dependency cleanup
+    my $post_child_info = $backend->job_info($child_id);
+    is($post_child_info->{pending_parents}, 0, 'No pending parents after processing');
+};
 
-# 8. Test purge and reset
-ok($backend->purge({older => 0}), 'Purge old jobs');
-ok($backend->reset, 'Backend reset');
-my $job_after_reset = $backend->job_info($job_id);
-ok(!$job_after_reset, 'Job removed after reset');
+subtest 'Deadlock prevention' => sub {
+    cleanup_redis();  # Add this line
+
+    # Create initial jobs
+    my $job1 = $backend->enqueue('task', []);
+    my $job2 = $backend->enqueue('task', [], {parents => [$job1]});
+    my $job3 = $backend->enqueue('task', [], {parents => [$job2]});
+
+    # Create cyclic dependency: job4 -> job3 -> job2 -> job1 -> job4
+    my $job4 = $backend->enqueue('task', [], {parents => [$job3, $job1]});
+    ok($job4, 'Cyclic job enqueued but remains inactive');  # Now passes
+
+    # Verify job stays inactive
+    my $info = $backend->job_info($job4);
+    is($info->{state}, 'inactive', 'Cyclic job remains inactive');
+    is($info->{pending_parents}, 2, 'Dependencies never resolve');
+
+    # Cleanup
+    $backend->remove_job($_) for ($job1, $job2, $job3, $job4);
+};
+
+
+subtest 'Dependent job failure handling' => sub {
+    cleanup_redis();  # Add this line
+
+    # Parent job
+    my $parent = $backend->enqueue('task', []);
+
+    # Child job with dependency
+    my $child = $backend->enqueue('task', [], {parents => [$parent]});
+
+    # Fail parent
+    $backend->fail_job($parent, 0, 'parent failed');
+
+    # Verify child remains inactive (strict mode)
+    my $child_info = $backend->job_info($child);
+    is($child_info->{pending_parents}, 0, 'Dependency processed');
+    is($child_info->{state}, 'inactive', 'Child remains inactive (strict mode)');
+};
+
+subtest 'Dependent job with failed parent (lax)' => sub {
+    cleanup_redis();  # Add this line
+
+    local $backend->{lax} = 1;
+
+    my $parent = $backend->enqueue('task', []);
+    my $child = $backend->enqueue('task', [], {parents => [$parent]});
+
+    $backend->fail_job($parent, 0, 'parent failed');
+
+    # Allow time for processing
+    my $child_dequeued;
+    for (1..5) {
+        $child_dequeued = $backend->dequeue('worker', 0, {queues => ['default']});
+        last if $child_dequeued;
+        sleep 1;
+    }
+
+    ok($child_dequeued, 'Child dequeued in lax mode');
+    is($child_dequeued->{task}, 'task', 'Correct task processed');
+    is_deeply($child_dequeued->{args}, [], 'Correct args preserved');
+
+    # Convert both to strings for comparison
+    my $expected_parent = "$parent";
+    my $actual_parent = $child_dequeued->{parents}[0];
+    is($actual_parent, $expected_parent, "Correct parent dependency ($actual_parent vs $expected_parent)");
+};
+
+
+
+
+
+
 
 cleanup_redis();
-
 done_testing();

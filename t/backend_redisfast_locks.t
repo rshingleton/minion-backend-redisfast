@@ -1,14 +1,26 @@
 use strict;
 use warnings;
-use Test::More;
+use Test2::V0;
+use Test::RedisServer;
 use Redis::Fast;
 use FindBin;
+use Time::HiRes 'time';
 use lib "$FindBin::Bin/../lib";
 use Minion::Backend::RedisFast;
+use Test2::AsyncSubtest;
+use Test2::IPC;
 
-my $redis_url = $ENV{REDIS_URL} || '127.0.0.1:6379';
-my $prefix = "minion_lock_test_" . int(rand(10000));
-my $redis = Redis::Fast->new(server => $redis_url);
+my $redis_server;
+eval {
+    $redis_server = Test::RedisServer->new(
+        conf => {
+            port => 7474,
+        }
+    );
+} or plan skip_all => 'redis-server is required for this test';
+
+my $redis = Redis::Fast->new($redis_server->connect_info);
+my $prefix = "minion_test_" . int(rand(10000));
 
 sub cleanup_redis {
     my $cursor = 0;
@@ -20,46 +32,136 @@ sub cleanup_redis {
 }
 cleanup_redis();
 
-my $backend = Minion::Backend::RedisFast->new(server => $redis_url, prefix => $prefix);
+my $backend = Minion::Backend::RedisFast->new($redis_server->connect_info, prefix => $prefix);
 
-# Test exclusive lock (limit => 1)
-my $lock1 = $backend->lock('resource1', 10, {limit => 1});
-ok($lock1, 'Acquired exclusive lock');
-is($lock1->{validity}, 9.9, 'Lock validity is 99% of TTL');
+# Test 1: Basic exclusive lock acquisition
+subtest 'Exclusive lock' => sub {
+    my $lock = $backend->lock('resource1', 10);
+    ok($lock, 'Acquired exclusive lock');
+    is($lock->{validity}, 9.9, 'Lock validity is 99% of TTL');
 
-# Try to acquire same lock again (should fail)
-my $lock1_dup = $backend->lock('resource1', 10, {limit => 1});
-ok(!$lock1_dup, 'Cannot acquire exclusive lock twice');
+    # Verify lock exists in Redis
+    my $score = $redis->zscore($lock->{resource}, $lock->{value});
+    ok(defined $score && $score > time, 'Lock exists with future expiration');
 
-# Release lock and re-acquire
-ok($backend->unlock($lock1->{resource}, $lock1->{value}), 'Released exclusive lock');
-my $lock1_new = $backend->lock('resource1', 10, {limit => 1});
-ok($lock1_new, 'Re-acquired exclusive lock after release');
+    # Test ownership verification
+    ok(!$backend->unlock($lock->{resource}, 'wrong_value'), 'Wrong value fails to unlock');
+    ok($backend->unlock($lock->{resource}, $lock->{value}), 'Correct value unlocks');
 
-# Test shared lock (limit => 2)
-my $shared_lock1 = $backend->lock('shared_resource', 10, {limit => 2});
-ok($shared_lock1, 'Acquired first shared lock');
+    # Verify lock removal
+    is($redis->zscore($lock->{resource}, $lock->{value}), undef, 'Lock removed from Redis');
+};
 
-my $shared_lock2 = $backend->lock('shared_resource', 10, {limit => 2});
-ok($shared_lock2, 'Acquired second shared lock');
+# Test 2: Shared lock concurrency
+subtest 'Shared locks' => sub {
+    my $lock1 = $backend->lock('shared', 10, {limit => 2});
+    ok($lock1, 'Acquired first shared lock');
 
-# Third attempt should fail
-my $shared_lock3 = $backend->lock('shared_resource', 10, {limit => 2});
-ok(!$shared_lock3, 'Cannot exceed shared lock limit');
+    my $lock2 = $backend->lock('shared', 10, {limit => 2});
+    ok($lock2, 'Acquired second shared lock');
 
-# Release one shared lock
-ok($backend->unlock($shared_lock1->{resource}, $shared_lock1->{value}), 'Released first shared lock');
+    my $lock3 = $backend->lock('shared', 10, {limit => 2});
+    ok(!$lock3, 'Cannot exceed shared lock limit');
 
-# Third attempt should now succeed
-$shared_lock3 = $backend->lock('shared_resource', 10, {limit => 2});
-ok($shared_lock3, 'Acquired third shared lock after release');
+    # Release one lock
+    ok($backend->unlock($lock1->{resource}, $lock1->{value}), 'Released first lock');
 
-# Test lock expiration (simulate by setting low TTL)
-my $expiring_lock = $backend->lock('ephemeral', 1, {limit => 1});
-ok($expiring_lock, 'Acquired expiring lock');
-sleep 2; # Wait for lock to expire
-my $expired_lock_attempt = $backend->lock('ephemeral', 1, {limit => 1});
-ok($expired_lock_attempt, 'Lock expired and can be re-acquired');
+    # Should be able to acquire again
+    my $lock4 = $backend->lock('shared', 10, {limit => 2});
+    ok($lock4, 'Acquired new lock after release');
+
+    # Cleanup
+    $backend->unlock($lock2->{resource}, $lock2->{value});
+    $backend->unlock($lock4->{resource}, $lock4->{value});
+};
+
+# Test 3: Lock expiration and cleanup
+subtest 'Lock expiration' => sub {
+    my $lock = $backend->lock('ephemeral', 1);
+    ok($lock, 'Acquired temporary lock');
+
+    # Immediate re-lock should fail
+    ok(!$backend->lock('ephemeral', 1), 'Lock still active');
+
+    # Wait for expiration
+    sleep 2;
+
+    # Verify automatic cleanup
+    my $expired_lock = $backend->lock('ephemeral', 1);
+    ok($expired_lock, 'Acquired lock after expiration');
+    is($redis->zcard($expired_lock->{resource}), 1, 'Only one active lock');
+
+    # Cleanup
+    $backend->unlock($expired_lock->{resource}, $expired_lock->{value});
+};
+
+# Test 4: Concurrent locking using simple forking
+subtest 'Concurrent locking' => sub {
+    my $concurrency = 3;
+    my $attempts = 5;
+    my @pids;
+
+    # Create pipe for synchronization
+    pipe(my ($reader, $writer)) or die "Pipe failed: $!";
+
+    for (1..$attempts) {
+        my $pid = fork();
+        die "Fork failed: $!" unless defined $pid;
+
+        if ($pid == 0) { # Child
+            close $writer;  # Close writer in child
+            my $buf;
+            sysread($reader, $buf, 1); # Wait for parent signal
+
+            my $worker_backend = Minion::Backend::RedisFast->new(
+                $redis_server->connect_info,
+                prefix => $prefix
+            );
+
+            # Acquire lock or exit with failure
+            my $lock = $worker_backend->lock(
+                'concurrent',
+                10,
+                {limit => $concurrency}
+            ) or exit 1;
+
+            exit 0; # Success
+        }
+        else { # Parent
+            push @pids, $pid;
+        }
+    }
+
+    # Signal all children AFTER forking
+    close $reader;
+    print $writer 'G' for 1..$attempts;
+    close $writer;
+
+    # Wait for results
+    my $success = 0;
+    foreach my $pid (@pids) {
+        waitpid($pid, 0);
+        $success++ if $? == 0;
+    }
+
+    is($success, $concurrency, "Only $concurrency concurrent locks granted");
+};
+
+# Test 5: Stale lock cleanup
+subtest 'Stale lock cleanup' => sub {
+    # Manually add expired lock
+    $redis->zadd($backend->_key('lock:stale'), time - 10, 'stale_value');
+
+    # Attempt to acquire new lock
+    my $lock = $backend->lock('stale', 10);
+    ok($lock, 'Acquired new lock after stale cleanup');
+
+    # Verify stale lock was removed
+    is($redis->zscore($backend->_key('lock:stale'), 'stale_value'), undef, 'Stale lock cleaned up');
+
+    # Cleanup
+    $backend->unlock($lock->{resource}, $lock->{value});
+};
 
 cleanup_redis();
 done_testing();

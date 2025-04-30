@@ -2,14 +2,23 @@
 use strict;
 use warnings;
 use Test::More;
+use Test::RedisServer;
 use Redis::Fast;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Minion::Backend::RedisFast;
 
-my $redis_url = $ENV{REDIS_URL} || '127.0.0.1:6379';
-my $prefix = "minion_remove_test_" . int(rand(10000));
-my $redis = Redis::Fast->new(server => $redis_url);
+my $redis_server;
+eval {
+    $redis_server = Test::RedisServer->new(
+        conf => {
+            port => 7474,
+        }
+    );
+} or plan skip_all => 'redis-server is required for this test';
+
+my $redis = Redis::Fast->new($redis_server->connect_info);
+my $prefix = "minion_test_" . int(rand(10000));
 
 sub cleanup_redis {
     my $cursor = 0;
@@ -21,7 +30,7 @@ sub cleanup_redis {
 }
 cleanup_redis();
 
-my $backend = Minion::Backend::RedisFast->new(server => $redis_url, prefix => $prefix);
+my $backend = Minion::Backend::RedisFast->new($redis_server->connect_info, prefix => $prefix);
 
 # Enqueue job to default queue
 my $job1 = $backend->enqueue('task1', []);

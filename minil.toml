@@ -1,4 +1,4 @@
-name = "minion-backend-redisfast"
+name = "Minion-Backend-RedisFast"
 badges = ["github-actions/test.yml"]
 module_maker="ModuleBuildTiny"
 static_install = "auto"
