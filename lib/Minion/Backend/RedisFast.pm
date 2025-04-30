@@ -407,11 +407,11 @@ sub new {
             if exists $redis_args{$param};
     }
 
-    # Add default failover handling if using Sentinel and no custom reconnect_on_error
-    if ($redis_args{sentinels} && !exists $redis_args{reconnect_on_error}) {
+    # Universal reconnect error handling
+    unless (exists $redis_args{reconnect_on_error}) {
         $redis_args{reconnect_on_error} = sub {
             my ($error) = @_;
-            return 1 if $error =~ /READONLY|CONNECTION/;
+            return 1 if $error =~ /READONLY|CONNECTION|LOADING|CLUSTERDOWN/;
             return -1;
         };
     }
@@ -588,7 +588,7 @@ sub _parse_job_data {
     $job{notes} = $self->json->decode($job{notes} // '{}');
     $job{result} = $self->json->decode($job{result} // '{}') if $job{state} eq 'finished';
     $job{error} = $self->json->decode($job{error} // '""') if $job{state} eq 'failed';
-    $job{parents} = $self->json->decode($job{parents} // '[]');  # Add this line
+    $job{parents} = $self->json->decode($job{parents} // '[]'); # Add this line
 
     return \%job;
 }
