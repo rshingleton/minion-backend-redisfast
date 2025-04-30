@@ -1,6 +1,5 @@
 use strict;
 use warnings;
-use v5.26;
 use Test::More;
 use Test::RedisServer;
 use Redis::Fast;
